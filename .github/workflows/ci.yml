@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.12"
+      # Same targets as local development; the Makefile pins them to uv.lock.
+      - run: make lint
+      - run: make test
+
+  # PyTorch and Transformers tests on synthetic checkpoints: no downloads, no GPU.
+  torch:
+    runs-on: macos-15
+    env:
+      HF_HUB_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.12"
+      - name: Require arm64
+        run: |
+          test "$(uname -m)" = arm64
+          uv run --locked python -c "import platform; assert platform.machine() == 'arm64', platform.machine()"
+      - run: uv run --locked pytest -m "not gpu and not checkpoint"

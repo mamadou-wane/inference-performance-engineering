@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Model files and caches
+weights/
+hf-cache/
+*.safetensors
+*.bin
+
+# Large local artifacts and diagnostic tensors
+artifacts/
+*.pt
+*.npy
+*.npz
+
+# Profiler output
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+*.pt.trace.json
+
+# Native build output
+build/
+dist/
+*.so
+*.o

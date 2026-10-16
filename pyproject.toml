@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ipe"
+version = "0.0.0"
+description = "A compact inference engine for Qwen3-1.7B, built to study correctness and GPU performance."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.15"
+# Pins follow vLLM 0.31.0's requirements, so the engine, the reference and the comparisons
+# share one lockfile.
+dependencies = [
+    "numpy",
+    "safetensors>=0.6.2",
+    "tokenizers>=0.21.1",
+    "torch==2.13.0",
+]
+
+[project.optional-dependencies]
+bench = ["vllm==0.31.0; sys_platform == 'linux'"]
+
+[dependency-groups]
+# Transformers is the correctness reference; the engine never imports it at run time.
+reference = ["transformers>=5.10.4,<5.18.0"]
+# safetensors and numpy let torch-free CI read checkpoint headers; mpmath gives the forward tests
+# exact reference values.
+dev = ["mpmath", "numpy", "pytest", "ruff", "safetensors>=0.6.2"]
+
+[tool.uv]
+default-groups = ["dev", "reference"]
+# Constrain the isolated editable-build toolchain separately from runtime dependencies.
+build-constraint-dependencies = [
+    "hatchling==1.32.4",
+    "editables==0.6",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.6.0",
+    "tomlkit==0.15.1",
+    "trove-classifiers==2026.9.21.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ipe"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers"
+markers = [
+    "gpu: needs an NVIDIA GPU",
+    "checkpoint: needs a downloaded checkpoint",
+]
