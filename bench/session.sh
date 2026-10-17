@@ -75,6 +75,11 @@ screen)
   check "driver $driver >= 580" test "$driver" -ge 580
   check "compute capability $capability >= 8.0" python3 -c "import sys; sys.exit(float('$capability') < 8.0)"
   log "host: $(nproc) CPUs, $(free -g | awk '/Mem:/ {print $2}') GB RAM, $(df -h . | awk 'NR == 2 {print $4}') free disk"
+  log "execution context: $([ -f /.dockerenv ] && echo container || echo host)"
+  log "sudo without password: $(sudo -n true 2>/dev/null && echo yes || echo no)"
+  log "profiling restricted to admins: $(grep -i RmProfilingAdminOnly /proc/driver/nvidia/params 2>/dev/null || echo unknown)"
+  log "CPU model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+  require  # a memory, driver or compute capability failure ends the screen before any download or install
   # The install supplies tools; the checks below, unchanged, decide whether they work.
   if root=$(cuda_toolkit); then
     log "CUDA toolkit: existing, $root"
@@ -93,18 +98,27 @@ screen)
   fi
   export PATH="$root/bin:$PATH" CUDA_HOME=$root  # the extension build, the sanitizer and ncu use this toolkit
   check "nvcc is CUDA 13" sh -c 'nvcc --version | grep -q "release 13\."'
-  log "execution context: $([ -f /.dockerenv ] && echo container || echo host)"
-  log "sudo without password: $(sudo -n true 2>/dev/null && echo yes || echo no)"
-  log "profiling restricted to admins: $(grep -i RmProfilingAdminOnly /proc/driver/nvidia/params 2>/dev/null || echo unknown)"
   start=$(date +%s)
   check "locked install" uv sync --locked --extra bench
   log "install seconds: $(( $(date +%s) - start ))"
-  log "CPU model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
   run python bench/probes.py env > "$out/environment.json"
   check "extension build" run python bench/probes.py extension
   check "compute-sanitizer memcheck" compute-sanitizer --tool memcheck --error-exitcode 1 .venv/bin/python bench/probes.py extension
   # ncu must exit 0 and its CSV must hold a positive counter value; an error message can name the metric.
-  check "ncu counters" sh -c "ncu --csv --kernel-name add_one --metrics sm__cycles_elapsed.avg .venv/bin/python bench/probes.py extension > '$out/ncu.csv' 2>&1 && .venv/bin/python bench/probes.py ncu-check '$out/ncu.csv'"
+  ncu_counters() {  # CSV [PREFIX...]: profile the probe kernel, behind PREFIX if given, and check the CSV
+    local csv=$1; shift
+    "$@" "$(command -v ncu)" --csv --kernel-name add_one --metrics sm__cycles_elapsed.avg .venv/bin/python bench/probes.py \
+      extension > "$csv" 2>&1 && .venv/bin/python bench/probes.py ncu-check "$csv"
+  }
+  if ncu_counters "$out/ncu.csv" >> "$out/$stage.log" 2>&1; then
+    log "PASS ncu counters, unprivileged"
+  elif grep -q ERR_NVGPUCTRPERM "$out/ncu.csv"; then
+    # Only a counter-permission refusal is retried, and only this command runs with sudo; sudo resets PATH and HOME.
+    log "ncu counters, unprivileged: ERR_NVGPUCTRPERM"
+    check "ncu counters, sudo -n" ncu_counters "$out/ncu-sudo.csv" sudo -n env "PATH=$PATH" "CUDA_HOME=$CUDA_HOME" "HOME=$HOME"
+  else
+    log "FAIL ncu counters, unprivileged"
+  fi
   log "nsys: $(nsys --version 2>/dev/null || echo unavailable)"  # optional; the PyTorch profiler supplies the timeline
   check "vllm extensions" run python bench/probes.py vllm
   ;;

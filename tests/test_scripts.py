@@ -1,7 +1,10 @@
 """bench/session.sh and bench/brev_session.sh against stub tools: no GPU, no Brev account.
 
 session.sh: a failed correctness check stops the stage before any profiling or timing, and the
-ncu check needs both a clean exit and a counter value; nsys is recorded and never fails the screen. The screen uses an existing CUDA 13 toolkit
+ncu check needs both a clean exit and a counter value, and only a counter-permission refusal retries
+that one command under sudo -n (stubbed, never the real sudo); nsys is recorded and never fails the screen. A memory,
+driver or compute capability failure stops the screen, after the host records, before any download or
+install. The screen uses an existing CUDA 13 toolkit
 that holds nvcc, ncu and compute-sanitizer; without one it checks the installer's prerequisites
 (which gcc, gcc 6 to 15, the download tools) before downloading the pinned runfile, runs it only
 after its checksum passes, installs the toolkit alone under HOME with no_new_privs, and records the
@@ -13,6 +16,7 @@ and exits 4.
 """
 
 import os
+import re
 import shutil
 import signal
 import stat
@@ -40,7 +44,8 @@ def tools(tmp_path):
     log = tmp_path / "calls.log"
     for name in ("compute-sanitizer", "nsys"):
         stub(directory, name, f'echo "{name} $*" >> {log}\n')
-    stub(directory, "nvidia-smi", f'echo "nvidia-smi $*" >> {log}\necho "NVIDIA RTX A6000, 49140 MiB, 580.95.05, 8.6"\n')
+    stub(directory, "nvidia-smi", f'echo "nvidia-smi $*" >> {log}\n'
+                                  'echo "${SMI_ROW-NVIDIA RTX A6000, 49140 MiB, 580.95.05, 8.6}"\n')
     stub(directory, "nvcc", 'echo "Cuda compilation tools, release 13.0, V13.0.88"\n')
     stub(directory, "uv", f'echo "uv $*${{CUDA_HOME:+ CUDA_HOME=$CUDA_HOME}}" >> {log}\n'
                           '[[ "$*" == *pytest* && -n "${SUITE_FAILS:-}" ]] && exit 1\nexit 0\n')
@@ -59,6 +64,9 @@ def tools(tmp_path):
                             f'cp {tmp_path}/runfile "$out"\n')
     stub(directory, "md5sum", f'echo "md5sum $* $(cat)" >> {log}\n[ -z "${{MD5_FAILS:-}}" ]\n')
     stub(directory, "setpriv", f'echo "setpriv $*" >> {log}\nshift\nexec "$@"\n')
+    stub(directory, "sudo", f'echo "sudo $*" >> {log}\n'  # never the real sudo; AS_ROOT marks the privileged run
+                            '[ -n "${SUDO_DENIED:-}" ] && { echo "sudo: a password is required" >&2; exit 1; }\n'
+                            '[ "$1" = -n ] && shift\nAS_ROOT=1 exec "$@"\n')
     return directory, log
 
 
@@ -108,6 +116,28 @@ def test_the_ncu_screen_needs_a_clean_exit_and_a_counter(tools, tmp_path, output
     assert ("PASS ncu counters" in log) is passes and ("FAIL ncu counters" in log) is not passes
 
 
+@pytest.mark.parametrize(("unprivileged", "root", "sudo_denied", "lines"), [
+    (NCU_ROW, None, False, ["PASS ncu counters, unprivileged"]),
+    (NCU_DENIED, NCU_ROW, False, ["ncu counters, unprivileged: ERR_NVGPUCTRPERM", "PASS ncu counters, sudo -n"]),
+    (NCU_DENIED, NCU_DENIED, False, ["ncu counters, unprivileged: ERR_NVGPUCTRPERM", "FAIL ncu counters, sudo -n"]),
+    (NCU_DENIED, NCU_ROW, True, ["ncu counters, unprivileged: ERR_NVGPUCTRPERM", "FAIL ncu counters, sudo -n"]),
+    ("==ERROR== the application returned an error code", NCU_ROW, False, ["FAIL ncu counters, unprivileged"]),
+])
+def test_ncu_falls_back_to_sudo_only_on_a_counter_permission_refusal(tools, tmp_path, unprivileged, root, sudo_denied, lines):
+    stub(tools[0], "ncu", 'if [ -n "${AS_ROOT:-}" ]; then printf "%s\\n" "$NCU_ROOT_OUT"; else printf "%s\\n" "$NCU_OUT"; fi\n')
+    env = {"NCU_OUT": unprivileged, "NCU_ROOT_OUT": root or "", **({"SUDO_DENIED": "1"} if sudo_denied else {})}
+    _, out = session(tools, tmp_path, "screen", **env)
+    log = (out / "screen.log").read_text().splitlines()
+    assert [line for line in log if "ncu counters" in line] == lines
+    sudo = [line for line in tools[1].read_text().splitlines() if line.startswith("sudo ") and line != "sudo -n true"]
+    if root is None or "ERR_NVGPUCTRPERM" not in unprivileged:
+        assert sudo == []  # no privileged attempt unless unprivileged ncu was refused the counters
+    else:  # exactly the designated profiling command, once
+        assert len(sudo) == 1 and re.fullmatch(r"sudo -n env PATH=.* CUDA_HOME=\S* HOME=\S* \S*/ncu --csv --kernel-name add_one "
+                                               r"--metrics sm__cycles_elapsed\.avg \.venv/bin/python bench/probes\.py extension",
+                                               sudo[0])
+
+
 @pytest.mark.parametrize(("nsys", "recorded"), [("echo 'NVIDIA Nsight Systems version 2025.3.2.474'", "version 2025"),
                                                  ("exit 127", "unavailable")])
 def test_nsys_is_recorded_and_never_fails_the_screen(tools, tmp_path, nsys, recorded):
@@ -117,6 +147,16 @@ def test_nsys_is_recorded_and_never_fails_the_screen(tools, tmp_path, nsys, reco
     log = (out / "screen.log").read_text().splitlines()
     assert any(line.startswith("nsys: ") and recorded in line for line in log)
     assert not any(line.startswith(("PASS", "FAIL")) and "nsys" in line for line in log)
+
+
+@pytest.mark.parametrize("row", ["NVIDIA A10, 23028 MiB, 570.148.08, 8.6", "Tesla T4, 15360 MiB, 580.95.05, 7.5",
+                                 "NVIDIA L4, 22491 MiB, 580.95.05, 8.9", ""])
+def test_a_hardware_or_driver_failure_stops_the_screen_before_any_download_or_install(tools, tmp_path, row):
+    result, out = session(tools, tmp_path, "screen", SMI_ROW=row)
+    log, calls = (out / "screen.log").read_text(), tools[1].read_text().splitlines()
+    assert result.returncode == 1 and "stopping: a required check failed" in log
+    assert "host:" in log and "profiling restricted to admins" in log and "CPU model" in log  # the records remain
+    assert "CUDA toolkit" not in log and not any(line.startswith(("curl ", "uv ")) for line in calls)
 
 
 def test_an_existing_cuda_13_toolkit_is_used_and_nothing_is_downloaded(tools, tmp_path):
