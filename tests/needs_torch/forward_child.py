@@ -6,8 +6,13 @@ second runs the engine and compares. Separate processes keep the 1.7B fp32 refer
 
     forward_child.py reference DIRECTORY DTYPE ATTENTION LENGTH BATCH OUT [patched]
     forward_child.py engine DIRECTORY DTYPE BACKEND LENGTH BATCH REFERENCE
+    forward_child.py cached-reference DIRECTORY DTYPE ATTENTION LENGTH PROMPT OUT
+    forward_child.py cached-engine DIRECTORY DTYPE BACKEND LENGTH PROMPT REFERENCE [SAVE]
+    forward_child.py hidden DIRECTORY DTYPE BACKEND LENGTH OUT
 
-The engine prints a JSON list of problems on its last line; an empty list is a pass.
+The cached commands run one sequence teacher-forced from PROMPT and keep the fp32 logits at
+positions PROMPT-1 to LENGTH-1. Engine commands print a JSON list of problems on their last line;
+an empty list is a pass.
 """
 
 import json
@@ -92,10 +97,63 @@ def run_engine(directory, dtype, backend, length, batch, reference_file):
     print(json.dumps(problems))
 
 
+@torch.no_grad()
+def run_cached_reference(directory, dtype, attention, length, prompt, out):
+    from transformers import Qwen3ForCausalLM
+
+    model = Qwen3ForCausalLM.from_pretrained(directory, dtype=dtype, attn_implementation=attention).eval()
+    token_ids = token_rows(directory, length, 1)
+    logits = torch.empty(length - prompt + 1, model.config.vocab_size)
+    output = model(input_ids=token_ids[:, :prompt], use_cache=True, logits_to_keep=1)
+    logits[0], cache = output.logits[0, -1], output.past_key_values
+    for row, position in enumerate(range(prompt, length), start=1):
+        output = model(input_ids=token_ids[:, position:position + 1], past_key_values=cache, use_cache=True)
+        logits[row], cache = output.logits[0, -1], output.past_key_values
+    torch.save(logits, out)
+
+
+@torch.no_grad()
+def run_cached_engine(directory, dtype, backend, length, prompt, reference_file, save):
+    from ipe.engine import Engine
+    from ipe.weights import load_checkpoint
+
+    # fp32 weights cast once give the same bits as bf16 views cast at each use, twice as fast.
+    engine = Engine(load_checkpoint(directory, dtype=dtype, device="cpu"), batch=1, capacity=length, backend=backend)
+    token_ids = token_rows(directory, length, 1)
+    logits = torch.empty(length - prompt + 1, engine.loaded.config.vocab_size)
+    logits[0] = engine.prefill(token_ids[:, :prompt])[0]
+    for row, position in enumerate(range(prompt, length), start=1):
+        logits[row] = engine.decode(token_ids[:, position])[0]
+    del engine  # the comparison below needs the memory
+    expected = torch.load(reference_file, mmap=True, weights_only=True)
+    problems = differences("cached logits", logits, expected)
+    if problems:
+        unequal = (logits != expected).any(-1).nonzero()
+        problems.append(f"first differing position {prompt - 1 + int(unequal[0])}")
+    if save:
+        torch.save(logits, save)
+    print(json.dumps(problems))
+
+
+@torch.no_grad()
+def run_hidden(directory, dtype, backend, length, out):
+    from ipe.forward import final_hidden
+    from ipe.weights import load_checkpoint
+
+    loaded = load_checkpoint(directory, dtype=torch.bfloat16, device="cpu")
+    torch.save(final_hidden(loaded, token_rows(directory, length, 1), dtype=dtype, backend=backend)[0], out)
+
+
 if __name__ == "__main__":
-    role, directory, dtype_name, implementation, length, batch, path = sys.argv[1:8]
-    arguments = (Path(directory), getattr(torch, dtype_name), implementation, int(length), int(batch), path)
+    role, directory, dtype_name, implementation, length = sys.argv[1:6]
+    common = (Path(directory), getattr(torch, dtype_name), implementation, int(length))
     if role == "reference":
-        run_reference(*arguments, patched=sys.argv[8:] == ["patched"])
+        run_reference(*common, int(sys.argv[6]), sys.argv[7], patched=sys.argv[8:] == ["patched"])
+    elif role == "engine":
+        run_engine(*common, int(sys.argv[6]), sys.argv[7])
+    elif role == "cached-reference":
+        run_cached_reference(*common, int(sys.argv[6]), sys.argv[7])
+    elif role == "cached-engine":
+        run_cached_engine(*common, int(sys.argv[6]), sys.argv[7], sys.argv[8] if len(sys.argv) > 8 else None)
     else:
-        run_engine(*arguments)
+        run_hidden(*common, sys.argv[6])

@@ -6,6 +6,7 @@ Not covered: GPU kernels and SDPA backend selection on CUDA, batches above 2.
 """
 
 import dataclasses
+import json
 
 import accuracy
 import mpmath
@@ -126,7 +127,7 @@ def divided_rms_norm(x, weight, eps):
     return weight * (h / torch.sqrt(h.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
 
 
-def seed(monkeypatch, bug):
+def seed(monkeypatch, bug, prompt=PROMPT):
     attention, decoder_layer, rotary_tables = ops.attention, ipe.engine.decoder_layer, ops.rotary_tables
     if bug == "interleaved rotary":
         monkeypatch.setattr(ops, "apply_rotary", interleaved_rotary)
@@ -143,7 +144,7 @@ def seed(monkeypatch, bug):
         monkeypatch.setattr(ops, "rms_norm", bf16_rms_norm)
     elif bug == "first decode step rotated one position late":
         def first_late(x, layer, rope, config, *, backend, cache=None, start=0):
-            if start == PROMPT:
+            if start == prompt:
                 rope = tuple(t[1:] for t in rotary_tables(torch.arange(start, start + 2), config.head_dim,
                                                           config.rope_theta, x.dtype))
             return decoder_layer(x, layer, rope, config, backend=backend, cache=cache, start=start)
@@ -166,6 +167,7 @@ def seed(monkeypatch, bug):
 BUGS = ("interleaved rotary", "decode rotated one position late", "first decode step rotated one position late",
         "no QK-norm", "RMSNorm in bf16", "decode misses its own key", "decode reads one position past its end",
         "epsilon 1e-5")
+REORDERINGS = ("uniform rotary offset", "RMSNorm divides by the root")
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -180,7 +182,7 @@ def test_the_rule_fails_seeded_bugs_at_fp32(rule_inputs, monkeypatch, backend, b
 
 @pytest.mark.parametrize("dtype", RUN_DTYPES)
 @pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("variant", ("uniform rotary offset", "RMSNorm divides by the root"))
+@pytest.mark.parametrize("variant", REORDERINGS)
 def test_the_rule_accepts_legitimate_reorderings(rule_inputs, monkeypatch, dtype, backend, variant):
     seed(monkeypatch, variant)
     assert rule_failures(rule_inputs, dtype, backend) == []
@@ -420,3 +422,96 @@ def test_cached_and_greedy_decoding_equal_the_reference_on_the_development_check
                     backend=backend)
     assert same_bits(teacher_forced(engine, token_ids, 64), expected)
     assert torch.equal(engine.generate(token_ids[:, :64], 64).tokens, greedy)
+
+
+@pytest.mark.checkpoint
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_the_rule_separates_seeded_bugs_from_reorderings_on_the_development_checkpoint(stored, monkeypatch, backend):
+    """Qwen3-0.6B, one 256-token window from position 64: every seeded bug fails at fp32, and both
+    reorderings pass at bf16 and fp32."""
+    from forward_child import token_rows
+
+    stored("qwen3-0.6b")
+    directory = WEIGHTS / "qwen3-0.6b"
+    views = load_checkpoint(directory, dtype=torch.bfloat16, device="cpu")
+    fp32 = load_checkpoint(directory, dtype=torch.float32, device="cpu")
+    token_ids, positions = token_rows(directory, 256, 1), list(range(63, 256))
+    oracle = lm_logits(views, final_hidden(views, token_ids, dtype=F64)[:, positions])
+    references = {dtype: [accuracy.errors(oracle, forward_full(views, token_ids, dtype=dtype, backend=reference,
+                                                                logit_positions=positions)) for reference in BACKENDS]
+                  for dtype in RUN_DTYPES}
+
+    def failures(loaded, dtype):
+        engine = Engine(loaded, batch=1, capacity=257, dtype=dtype, backend=backend)  # one spare position
+        return accuracy.failures(accuracy.errors(oracle, teacher_forced(engine, token_ids, 64)), references[dtype])
+
+    missed = []
+    for bug in BUGS:
+        with monkeypatch.context() as patch:
+            loaded = fp32
+            if bug == "epsilon 1e-5":
+                loaded = dataclasses.replace(fp32, config=dataclasses.replace(fp32.config, rms_norm_eps=1e-5))
+            seed(patch, bug, prompt=64)
+            if not failures(loaded, torch.float32):
+                missed.append(bug)
+    rejected = []
+    for variant in REORDERINGS:
+        for dtype, loaded in ((torch.float32, fp32), (torch.bfloat16, views)):
+            with monkeypatch.context() as patch:
+                seed(patch, variant, prompt=64)
+                if result := failures(loaded, dtype):
+                    rejected.append((variant, dtype, result))
+    assert (missed, rejected) == ([], [])
+
+
+TARGET = [("bfloat16", backend, 1024) for backend in BACKENDS] + [("float32", backend, 4224) for backend in BACKENDS]
+TARGET_PROMPT = 64
+
+
+@pytest.fixture(scope="module")
+def target_runs(stored, tmp_path_factory):
+    from test_forward_checkpoint import run_child
+
+    stored("qwen3-1.7b")
+    directory, work = WEIGHTS / "qwen3-1.7b", tmp_path_factory.mktemp("target")
+    problems = {}
+    for dtype, backend, length in TARGET:
+        reference = work / "reference.pt"
+        run_child("cached-reference", directory, dtype, BACKENDS[backend], length, TARGET_PROMPT, reference)
+        save = [work / f"engine-{backend}.pt"] if dtype == "float32" else []
+        output = run_child("cached-engine", directory, dtype, backend, length, TARGET_PROMPT, reference, *save)
+        problems[(dtype, backend, length)] = json.loads(output.splitlines()[-1])
+        reference.unlink()
+    for name, dtype, backend in (("oracle", "float64", "math"), ("math", "float32", "math"), ("sdpa", "float32", "sdpa")):
+        run_child("hidden", directory, dtype, backend, 4224, work / f"hidden-{name}.pt")
+    return directory, work, problems
+
+
+@pytest.mark.checkpoint
+@pytest.mark.parametrize(("dtype", "backend", "length"), TARGET)
+def test_cached_decoding_equals_the_reference_on_the_target_checkpoint(target_runs, dtype, backend, length):
+    assert target_runs[2][(dtype, backend, length)] == []
+
+
+@pytest.mark.checkpoint
+def test_cached_decoding_meets_the_accuracy_rule_on_the_target_checkpoint(target_runs, record_property):
+    """fp32 over 4,224 positions from 64; oracle and reference logits are built per chunk."""
+    directory, work, _ = target_runs
+    loaded = load_checkpoint(directory, dtype=torch.bfloat16, device="cpu")
+    hidden = {name: torch.load(work / f"hidden-{name}.pt", mmap=True, weights_only=True) for name in ("oracle", *BACKENDS)}
+    engine = {backend: torch.load(work / f"engine-{backend}.pt", mmap=True, weights_only=True) for backend in BACKENDS}
+    parts = {name: [] for name in (*BACKENDS, *(f"engine {backend}" for backend in BACKENDS))}
+    first = TARGET_PROMPT - 1
+    for start in range(first, 4224, 512):
+        stop = min(start + 512, 4224)
+        oracle = lm_logits(loaded, hidden["oracle"][start:stop])
+        for backend in BACKENDS:
+            parts[backend].append(accuracy.errors(oracle, lm_logits(loaded, hidden[backend][start:stop])))
+            parts[f"engine {backend}"].append(accuracy.errors(oracle, engine[backend][start - first:stop - first]))
+    errors = {name: accuracy.Errors(torch.cat([p.max_abs for p in chunks]), torch.cat([p.kl for p in chunks]))
+              for name, chunks in parts.items()}
+    for name, value in errors.items():
+        record_property(f"summary {name}", value.summary())
+    references = [errors[backend] for backend in BACKENDS]
+    assert {backend: accuracy.failures(errors[f"engine {backend}"], references) for backend in BACKENDS} == \
+        {backend: [] for backend in BACKENDS}

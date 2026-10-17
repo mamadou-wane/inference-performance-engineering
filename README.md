@@ -59,6 +59,7 @@ make lint                                                   # ruff
 make test                                                   # tests that need no PyTorch, GPU or checkpoint
 uv run --locked pytest -m "not gpu and not checkpoint"      # adds the PyTorch tests on synthetic checkpoints
 uv run --locked pytest -m checkpoint                        # needs both checkpoints downloaded
+uv run --locked pytest -m gpu                               # needs an NVIDIA GPU and Qwen3-1.7B
 ```
 
 `IPE_TEST_MPS=1` enables device tests on Apple MPS. Some checkpoint tests require approximately 14 GB of RAM per process.
@@ -69,6 +70,25 @@ IPE uses two verification approaches:
 - **Numerical accuracy:** When implementations legitimately differ, such as cached versus uncached decoding or SDPA versus math attention, `tests/needs_torch/accuracy.py` evaluates their errors against an fp64 oracle and reference variants. At fp32, the tests accept valid numerical reorderings while detecting eight seeded defects.
 
 Because certain bf16 RMSNorm defects fall within the end-to-end tolerance, `tests/needs_torch/test_rms_norm.py` independently verifies operator accuracy against exact values. This contract also applies to future fused kernels.
+
+## Benchmarks
+
+No GPU measurements exist yet. [bench/run.py](bench/run.py) times fixed-work generation for the engine, Transformers (dynamic and static cache) and vLLM, one implementation per process, and writes raw per-iteration timings to `results/`, which is not tracked:
+
+| Workload | Batch | Prompt | New tokens |
+| --- | --- | --- | --- |
+| W1 | 1 | 512 | 256 |
+| W2-4, W2-16 | 4, 16 | 512 | 256 |
+| W3 | 1 | 4,096 | 128 |
+
+```bash
+uv run --locked python bench/run.py run --impl engine --model weights/qwen3-1.7b --workloads W1 --out results/run1
+uv run --locked python bench/run.py summarize results/run1
+```
+
+Each process makes one cold call, then 10 warm-up and 30 measured pairs of latency(N) and latency(1), timed from a synchronized start to the device finishing; TPOT is (latency(N) - latency(1)) / (N - 1) for every implementation. Per-step host latency comes only from separate runs that synchronize every step, labeled as such. Existing results are never overwritten. `vllm-calibration` repeats the vLLM run with the sampling and prompt distribution of `vllm bench latency`, which cross-checks the harness.
+
+[bench/session.sh](bench/session.sh) holds the GPU session stages: requirements screen, probes, long correctness check, interleaved benchmark launches. A failed correctness check stops a stage before any profiling or timing. [bench/probes.py](bench/probes.py) holds the environment record, microbenchmarks and decode profile. [bench/brev_session.sh](bench/brev_session.sh) runs one stage on a new Brev instance within what is left of a session's budget and time, recorded in a ledger beside the results; it retrieves the results as one archive checked against its SHA-256 on the instance, then deletes the instance, confirmed by `brev ls`.
 
 ## Scope
 

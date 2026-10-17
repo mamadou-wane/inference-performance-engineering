@@ -2,7 +2,7 @@
 
 # lint and test install only the dev group from uv.lock and fail if uv.lock is out of date.
 lint:
-	uv run --locked --only-group dev ruff check src tests
+	uv run --locked --only-group dev ruff check src tests bench
 
 # tests/needs_torch needs PyTorch and Transformers: uv run --locked pytest -m "not gpu and not checkpoint".
 test:

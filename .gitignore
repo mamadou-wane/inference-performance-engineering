@@ -28,7 +28,8 @@ hf-cache/
 *.safetensors
 *.bin
 
-# Large local artifacts and diagnostic tensors
+# Benchmark results, large local artifacts and diagnostic tensors
+results/
 artifacts/
 *.pt
 *.npy

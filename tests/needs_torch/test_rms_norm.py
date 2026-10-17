@@ -19,7 +19,12 @@ EPS = 1e-6
 WIDTHS = (8, 128, 1000, 2048)
 
 # A native kernel adds itself here, wrapped to take and return CPU tensors.
-IMPLEMENTATIONS = {"ops.rms_norm": ops.rms_norm}
+IMPLEMENTATIONS = {
+    "ops.rms_norm": ops.rms_norm,
+    "ops.rms_norm on cuda": lambda x, weight, eps: ops.rms_norm(x.cuda(), weight.cuda(), eps).cpu(),
+}
+ON_GPU = [pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs an NVIDIA GPU")]
+NAMES = [pytest.param(name, marks=ON_GPU) if "cuda" in name else name for name in IMPLEMENTATIONS]
 
 
 def inputs(width, dtype, seed=0):
@@ -51,7 +56,7 @@ def violations(actual, expected, dtype, width):
     return int(((actual - expected).abs() > bound).sum()) + int((actual[expected == 0] != 0).sum())
 
 
-@pytest.mark.parametrize("name", IMPLEMENTATIONS)
+@pytest.mark.parametrize("name", NAMES)
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("width", WIDTHS)
 def test_rms_norm_meets_the_contract(name, dtype, width):
