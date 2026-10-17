@@ -7,7 +7,9 @@ that holds nvcc, ncu and compute-sanitizer; without one it checks the installer'
 after its checksum passes, installs the toolkit alone under HOME with no_new_privs, and records the
 installer's exit status apart from the tool checks. The real installer's behavior is not covered. brev_session.sh: the instance is deleted,
 and the deletion confirmed by a successful brev ls, after completion, failure, timeout and
-interruption; a budget too small creates nothing; an unconfirmed deletion exits 3.
+interruption; a budget too small creates nothing; an unconfirmed deletion exits 3; the stage waits
+for SSH to the host, and SSH that never comes up within its bound or the run's limit runs no stage
+and exits 4.
 """
 
 import os
@@ -216,7 +218,11 @@ case $1 in
 row.update({{"disk_price_per_gb_mo": float(os.environ["DISK_PRICE"])}} if "DISK_PRICE" in os.environ else {{}})
 print(json.dumps([row, dict(row, type="other_type", price_per_hour=9.0)], indent=2))' ;;
   create) [ -n "${{CREATE_FAILS:-}}" ] && exit 1; echo "$2" > {state}/name ;;
-  exec) if [[ "$*" == *"tar czf"* ]]; then
+  exec) if [ "$4" = true ]; then  # the SSH readiness probe: the first SSH_FAILS probes fail
+          n=$(( $(cat {state}/probes 2>/dev/null || echo 0) + 1 )); echo $n > {state}/probes
+          [ "$n" -gt "${{SSH_FAILS:-0}}" ] && touch {state}/ssh_up
+        elif [[ "$*" == *"tar czf"* ]]; then
+          [ -f {state}/ssh_up ] || exit 1
           [ -n "${{PACK_FAILS:-}}" ] && exit 1
           tar czf {state}/screen.tgz -C {state}/results screen
           echo "Executing on $2"; echo "SHA256 $(shasum -a 256 {state}/screen.tgz | cut -d" " -f1)  ../screen.tgz"
@@ -400,6 +406,21 @@ def test_deletion_that_brev_ls_does_not_confirm_exits_3_and_blocks_the_next_run(
         assert calls(brev).count("brev delete") > 1  # deletion is requested again while listed
     status, output = finish(guard(brev, tmp_path))
     assert status == 2 and "not confirmed deleted" in output
+
+
+def test_the_stage_waits_for_ssh_to_the_host(brev, tmp_path):
+    status, output = finish(guard(brev, tmp_path, SSH_FAILS="3"))
+    assert "SSH ready" in output and (brev[1] / "probes").read_text().strip() == "4"
+    assert "git clone" in calls(brev) and status == 1 and "deleted, confirmed" in output  # the stub stage exits 1
+
+
+@pytest.mark.parametrize(("minutes", "ssh_s"), [("120", "2"), ("0.2", "900")])  # the SSH bound, then the run's limit
+def test_ssh_that_never_comes_up_runs_no_stage_and_still_deletes(brev, tmp_path, minutes, ssh_s):
+    began = time.monotonic()
+    status, output = finish(guard(brev, tmp_path, minutes=minutes, SSH_FAILS="100000", IPE_SSH_S=ssh_s))
+    assert status == 4 and "SSH to the host not available" in output and "git clone" not in calls(brev)
+    assert "deleted, confirmed" in output and ledger(tmp_path)[-1][-1] == "1"
+    assert time.monotonic() - began < 20
 
 
 def test_a_failed_create_still_checks_for_an_instance(brev, tmp_path):

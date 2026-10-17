@@ -2,7 +2,7 @@
 # Run one bench/session.sh stage on a new Brev instance's host, then delete the instance, however the
 # stage ends:  bench/brev_session.sh TYPE SESSION_BUDGET_USD SESSION_MINUTES COMMIT STAGE RESULTS_DIR
 # Budget and minutes are session totals; RESULTS_DIR/brev-ledger.tsv records each run at whole hours.
-# Results arrive as RESULTS_DIR/<instance>/ after a SHA-256 check. Exit 3: deletion not confirmed.
+# Results arrive as RESULTS_DIR/<instance>/ after a SHA-256 check. Exit 3: deletion not confirmed; 4: no SSH.
 # Not covered: SIGKILL, the machine sleeping or losing power, the Brev organization changing mid-run.
 set -uo pipefail
 set -m        # each background job gets its own process group, so a kill reaches its children
@@ -12,6 +12,7 @@ type=$1 budget=$2 minutes=$3 commit=$4 stage=$5 results=$6
 case $stage in screen | probe | long | bench) ;; *) echo "unknown stage $stage"; exit 2 ;; esac
 name=ipe-$stage-$(date +%s)-$$ status=1 gone=0 started= created=0 active=
 margin=${IPE_DELETE_MARGIN_S:-600} poll=${IPE_POLL_S:-15} copy_s=${IPE_COPY_S:-120} call_s=${IPE_CALL_S:-60}
+ssh_s=${IPE_SSH_S:-900}  # how long after create the host's SSH may take to come up
 [ "$margin" -ge $((call_s + copy_s + 20 * poll)) ] || { echo "IPE_DELETE_MARGIN_S is too small"; exit 2; }
 ledger=$results/brev-ledger.tsv lock=$results/.brev-session.lock
 mkdir -p "$results" || exit 2
@@ -129,6 +130,15 @@ bounded "$deadline" brev create "$name" --type "$type" --timeout 600
 status=$?
 [ "$status" = 124 ] && say "time limit reached during create"
 [ "$status" = 0 ] || exit
+# Brev reports Ready before the host accepts SSH, and brev exec retries for only seconds.
+ssh_by=$(( created + ssh_s < deadline ? created + ssh_s : deadline ))
+until bounded $(( SECONDS + call_s < ssh_by ? SECONDS + call_s : ssh_by )) brev exec "$name" --host true; do
+  if [ "$SECONDS" -ge "$ssh_by" ]; then
+    status=4; say "SSH to the host not available $((SECONDS - created))s after create; the stage did not run"; exit
+  fi
+  sleep "$poll"
+done
+say "SSH ready $((SECONDS - created))s after create"
 bounded "$deadline" brev exec "$name" --host "curl -LsSf https://astral.sh/uv/install.sh | sh && . \$HOME/.local/bin/env &&
   git clone -q https://github.com/mamadou-wane/ipe.git ipe && cd ipe && git checkout -q $commit &&
   bench/session.sh $stage results/$stage"
