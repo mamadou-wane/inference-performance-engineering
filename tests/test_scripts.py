@@ -1,18 +1,21 @@
 """bench/session.sh and bench/brev_session.sh against stub tools: no GPU, no Brev account.
 
-session.sh: a failed correctness check stops the stage before any profiling or timing, and the
-ncu check needs both a clean exit and a counter value, and only a counter-permission refusal retries
-that one command under sudo -n (stubbed, never the real sudo); nsys is recorded and never fails the screen. A memory,
-driver or compute capability failure stops the screen, after the host records, before any download or
-install. The screen uses an existing CUDA 13 toolkit
-that holds nvcc, ncu and compute-sanitizer; without one it checks the installer's prerequisites
-(which gcc, gcc 6 to 15, the download tools) before downloading the pinned runfile, runs it only
-after its checksum passes, installs the toolkit alone under HOME with no_new_privs, and records the
-installer's exit status apart from the tool checks. The real installer's behavior is not covered. brev_session.sh: the instance is deleted,
-and the deletion confirmed by a successful brev ls, after completion, failure, timeout and
-interruption; a budget too small creates nothing; an unconfirmed deletion exits 3; the stage waits
-for SSH to the host, and SSH that never comes up within its bound or the run's limit runs no stage
-and exits 4.
+session.sh: a failed correctness check stops the stage before any profiling or timing. A memory,
+driver or compute capability failure stops the screen, after the host records, before any download
+or install. The ncu check needs both a clean exit and a counter value; a counter-permission refusal
+fails it unless IPE_SUDO_NCU=1, which retries only that command under sudo -n (stubbed, never the
+real sudo). nsys is recorded and never fails the screen. The screen uses an existing CUDA 13
+toolkit that holds nvcc, ncu and compute-sanitizer; without one it checks the installer's
+prerequisites (which gcc, gcc 6 to 15, the download tools) before downloading the pinned runfile,
+runs it only after its checksum passes, installs the toolkit alone under HOME with no_new_privs, and
+records the installer's exit status apart from the tool checks. The real installer's behavior is not
+covered.
+
+brev_session.sh: the price is compute plus any fixed disk priced in Brev's public catalog, and a
+price that cannot be established creates nothing; the instance is deleted, and the deletion
+confirmed by a successful brev ls, after completion, failure, timeout and interruption; a budget too
+small creates nothing; an unconfirmed deletion exits 3; the stage waits for SSH to the host, and SSH
+that never comes up within its bound or the run's limit runs no stage and exits 4.
 """
 
 import os
@@ -125,7 +128,7 @@ def test_the_ncu_screen_needs_a_clean_exit_and_a_counter(tools, tmp_path, output
 ])
 def test_ncu_falls_back_to_sudo_only_on_a_counter_permission_refusal(tools, tmp_path, unprivileged, root, sudo_denied, lines):
     stub(tools[0], "ncu", 'if [ -n "${AS_ROOT:-}" ]; then printf "%s\\n" "$NCU_ROOT_OUT"; else printf "%s\\n" "$NCU_OUT"; fi\n')
-    env = {"NCU_OUT": unprivileged, "NCU_ROOT_OUT": root or "", **({"SUDO_DENIED": "1"} if sudo_denied else {})}
+    env = {"NCU_OUT": unprivileged, "NCU_ROOT_OUT": root or "", "IPE_SUDO_NCU": "1", **({"SUDO_DENIED": "1"} if sudo_denied else {})}
     _, out = session(tools, tmp_path, "screen", **env)
     log = (out / "screen.log").read_text().splitlines()
     assert [line for line in log if "ncu counters" in line] == lines
@@ -136,6 +139,15 @@ def test_ncu_falls_back_to_sudo_only_on_a_counter_permission_refusal(tools, tmp_
         assert len(sudo) == 1 and re.fullmatch(r"sudo -n env PATH=.* CUDA_HOME=\S* HOME=\S* \S*/ncu --csv --kernel-name add_one "
                                                r"--metrics sm__cycles_elapsed\.avg \.venv/bin/python bench/probes\.py extension",
                                                sudo[0])
+
+
+def test_without_authorization_a_counter_refusal_fails_and_sudo_never_runs(tools, tmp_path):
+    stub(tools[0], "ncu", 'if [ -n "${AS_ROOT:-}" ]; then printf "%s\\n" "$NCU_ROOT_OUT"; else printf "%s\\n" "$NCU_OUT"; fi\n')
+    _, out = session(tools, tmp_path, "screen", NCU_OUT=NCU_DENIED, NCU_ROOT_OUT=NCU_ROW)
+    log = (out / "screen.log").read_text().splitlines()
+    assert [line for line in log if "ncu counters" in line] == [
+        "FAIL ncu counters, unprivileged: ERR_NVGPUCTRPERM; sudo -n not authorized"]
+    assert not any(line.startswith("sudo ") and line != "sudo -n true" for line in tools[1].read_text().splitlines())
 
 
 @pytest.mark.parametrize(("nsys", "recorded"), [("echo 'NVIDIA Nsight Systems version 2025.3.2.474'", "version 2025"),
@@ -280,6 +292,19 @@ print(json.dumps([row, dict(row, type="other_type", price_per_hour=9.0)], indent
 print(json.dumps({{"workspaces": ws or None}}, indent=2))' "${{names[@]}}" ;;
 esac
 ''')
+    # Brev's public catalog as its ListPublicInstanceType API returns it; STORAGE_PRICE adds a priced fixed disk.
+    stub(directory, "curl", f'''echo "curl $*" >> {state}/calls.log
+[ -n "${{CATALOG_FAILS:-}}" ] && exit 22
+python3 -c 'import json, os
+storage = [{{"count": 1, "size": "100GiB", "sizeBytes": {{"value": "100", "unit": "GB"}}}}]
+if "STORAGE_PRICE" in os.environ:
+    price = {{"currency": "USD", "amount": os.environ["STORAGE_PRICE"]}}
+    storage = [{{"count": 1, "size": os.environ.get("STORAGE_SIZE", "128GiB"), "sizeBytes": {{"value": "128", "unit": "GB"}},
+                "pricePerGbHr": price}}, {{"count": 1, "size": "0B", "minSize": "1GiB", "maxSize": "10TiB", "pricePerGbHr": price}}]
+item = {{"type": os.environ.get("CATALOG_TYPE", "hyperstack_A6000"), "basePrice": {{"currency": "USD", "amount": "0.600000"}},
+        "supportedStorage": storage}}
+print(json.dumps({{"items": [item, dict(item, type="other_type")]}}))'
+''')
     return directory, state
 
 
@@ -387,6 +412,20 @@ def test_an_unknown_stage_or_a_separately_billed_disk_creates_nothing(brev, tmp_
     assert status == 2 and "unknown stage" in output
     status, output = finish(guard(brev, tmp_path, DISK_PRICE="0.1"))
     assert status == 2 and "bills its disk separately" in output and "create" not in calls(brev)
+
+
+def test_separately_billed_storage_is_added_to_the_price(brev, tmp_path):
+    # 128 GiB is 137.438953472 GB, the larger of the two sizes, at $0.001/GB-hour; the optional 0B disk costs nothing.
+    _, output = finish(guard(brev, tmp_path, STORAGE_PRICE="0.001"))
+    assert "at $0.737439/h ($0.6 compute, $0.137439 storage)" in output and "deleted, confirmed" in output
+    assert ledger(tmp_path)[-1][3:5] == ["0.737439", "0.74"]
+
+
+@pytest.mark.parametrize("env", [{"CATALOG_FAILS": "1"}, {"CATALOG_TYPE": "renamed"},
+                                 {"STORAGE_PRICE": "0.001", "STORAGE_SIZE": "a lot"}])
+def test_a_price_that_cannot_be_established_creates_nothing(brev, tmp_path, env):
+    status, output = finish(guard(brev, tmp_path, **env))
+    assert status == 2 and "cannot be established" in output and "create" not in calls(brev)
 
 
 def test_the_recorded_cost_rounds_up(brev, tmp_path):

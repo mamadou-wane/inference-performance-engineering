@@ -54,12 +54,37 @@ except (ValueError, KeyError, TypeError):
 sys.exit(0 if any(w.get("name") == sys.argv[1] for w in workspaces) else 1)' "$name" <<< "$listing"
 }
 
-price=$(bounded $((SECONDS + call_s)) brev search --json | python3 -c '
+compute=$(bounded $((SECONDS + call_s)) brev search --json | python3 -c '
 import json, sys
 rows = [r for r in json.load(sys.stdin) if r["type"] == sys.argv[1]]
-if rows and "disk_price_per_gb_mo" not in rows[0]:  # a separately billed disk is not in price_per_hour
+if rows and "disk_price_per_gb_mo" not in rows[0]:  # a flexible disk of unknown size is billed separately
     print(rows[0]["price_per_hour"])' "$type")
-[ -n "$price" ] || { echo "type $type is not offered now, or bills its disk separately"; exit 2; }
+[ -n "$compute" ] || { echo "type $type is not offered now, or bills its disk separately"; exit 2; }
+# brev search drops the price of a fixed-size disk; Brev's public catalog, its source, has it. Sizes count high.
+storage=$(bounded $((SECONDS + call_s)) curl -fsS -H 'Content-Type: application/json' -H 'Connect-Protocol-Version: 1' \
+  -d '{"options": {"includeCpu": false, "skipAccessFilter": false}}' \
+  https://api.brev.dev/devplaneapi.v1.InstanceService/ListPublicInstanceType | python3 -c '
+import json, re, sys
+GB = {"B": 1e-9, "KB": 1e-6, "MB": 1e-3, "GB": 1.0, "TB": 1e3, "KiB": 2**10 / 1e9, "MiB": 2**20 / 1e9, "GiB": 2**30 / 1e9,
+      "TiB": 2**40 / 1e9}
+def gb(text):  # "128GiB" or "1TiB376GiB" in decimal GB; None if it does not parse
+    parts = re.findall(r"([0-9.]+)((?:[KMGT]i?)?B)", text)
+    return sum(float(n) * GB[u] for n, u in parts) if parts and "".join(n + u for n, u in parts) == text else None
+rows = [i for i in json.load(sys.stdin)["items"] if i["type"] == sys.argv[1]]
+if len(rows) != 1:
+    sys.exit(1)
+cost = 0.0
+for disk in rows[0].get("supportedStorage", []):
+    rate, size, size_bytes = float((disk.get("pricePerGbHr") or {}).get("amount") or 0), disk.get("size", ""), disk.get("sizeBytes") or {}
+    if rate == 0 or (size == "0B" and not size_bytes.get("value")):  # unpriced, or an optional disk create does not add
+        continue
+    sizes = ([gb(size)] if size else []) + ([float(size_bytes["value"]) * GB[size_bytes["unit"]]] if size_bytes.get("unit") in GB else [])
+    if not sizes or None in sizes:
+        sys.exit(1)
+    cost += max(sizes) * rate * disk.get("count", 1)
+print(round(cost, 6))' "$type")
+[ -n "$storage" ] || { echo "the full price of $type (compute and storage) cannot be established"; exit 2; }
+price=$(python3 -c "print(round($compute + $storage, 6))")
 limit=$(python3 - "$ledger" "$budget" "$minutes" "$price" "$margin" <<'EOF'
 import math, sys
 path, budget, minutes, price, margin = sys.argv[1], *map(float, sys.argv[2:])
@@ -83,7 +108,7 @@ print(int(min(minutes * 60 - spent_s, int((budget - spent_usd) / price) * 3600) 
 EOF
 ) || exit 2
 [ "$limit" -gt 0 ] || { echo "the session's remaining budget or time at \$$price/h does not cover a run plus ${margin}s"; exit 2; }
-say "$type at \$$price/h, stage $stage, limit ${limit}s"
+say "$type at \$$price/h (\$$compute compute, \$$storage storage), stage $stage, limit ${limit}s"
 
 retrieve() {  # one archive, accepted only if its SHA-256 matches the instance's
   local packed expected

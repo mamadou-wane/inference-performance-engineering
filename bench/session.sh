@@ -112,12 +112,14 @@ screen)
   }
   if ncu_counters "$out/ncu.csv" >> "$out/$stage.log" 2>&1; then
     log "PASS ncu counters, unprivileged"
-  elif grep -q ERR_NVGPUCTRPERM "$out/ncu.csv"; then
+  elif ! grep -q ERR_NVGPUCTRPERM "$out/ncu.csv"; then
+    log "FAIL ncu counters, unprivileged"
+  elif [ "${IPE_SUDO_NCU:-}" != 1 ]; then  # the sudo -n retry needs the owner's authorization for the session
+    log "FAIL ncu counters, unprivileged: ERR_NVGPUCTRPERM; sudo -n not authorized"
+  else
     # Only a counter-permission refusal is retried, and only this command runs with sudo; sudo resets PATH and HOME.
     log "ncu counters, unprivileged: ERR_NVGPUCTRPERM"
     check "ncu counters, sudo -n" ncu_counters "$out/ncu-sudo.csv" sudo -n env "PATH=$PATH" "CUDA_HOME=$CUDA_HOME" "HOME=$HOME"
-  else
-    log "FAIL ncu counters, unprivileged"
   fi
   log "nsys: $(nsys --version 2>/dev/null || echo unavailable)"  # optional; the PyTorch profiler supplies the timeline
   check "vllm extensions" run python bench/probes.py vllm
