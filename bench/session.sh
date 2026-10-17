@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GPU session steps, run on the instance from a clone at a fixed commit:
-#   bench/session.sh screen OUT   requirements check of a new instance type; downloads no weights
+#   bench/session.sh screen OUT   requirements check of a new instance type; no weights; CUDA 13 tools if missing
 #   bench/session.sh probe OUT    weights, GPU suite at 1,024 tokens, microbenchmarks, W1 profile
 #   bench/session.sh long OUT     GPU suite at 4,224 tokens; required before any W3 result
 #   bench/session.sh bench OUT    workloads: implementations interleaved over 3 launches, vllm bench latency
@@ -19,6 +19,38 @@ export PATH="$PWD/.venv/bin:$PATH"  # tools started directly (ncu, compute-sanit
 MODEL=weights/qwen3-1.7b
 REVISION=70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
 export HF_HOME=$PWD/hf-cache
+
+# torch's CUDA version, and the MD5 NVIDIA publishes for its runfile in docs/sidebar/md5sum.txt
+CUDA=13.0.3 RUNFILE=cuda_13.0.3_580.126.20_linux.run RUNFILE_MD5=13acdcabcb9e939f716c29eff8c12181
+
+cuda_toolkit() {  # prints the first toolkit whose nvcc is CUDA 13 and that holds ncu and compute-sanitizer
+  local nvcc root
+  nvcc=$(command -v nvcc)
+  for root in ${nvcc:+"${nvcc%/bin/nvcc}"} /usr/local/cuda /usr/local/cuda-13*; do
+    "$root/bin/nvcc" --version 2>/dev/null | grep -q "release 13\." && [ -x "$root/bin/ncu" ] &&
+      [ -x "$root/bin/compute-sanitizer" ] && { echo "$root"; return 0; }
+  done
+  return 1
+}
+
+cuda_prerequisites() {  # prints what the install lacks; the runfile's compiler check runs `which gcc`
+  local tool major
+  for tool in curl md5sum setpriv; do command -v "$tool" > /dev/null || { echo "no $tool"; return 1; }; done
+  which gcc > /dev/null 2>&1 || { echo "which gcc fails"; return 1; }
+  major=$(gcc -dumpversion) major=${major%%.*}
+  [ "$major" -ge 6 ] 2>/dev/null && [ "$major" -le 15 ] || { echo "gcc $major, CUDA 13.0 supports 6 to 15"; return 1; }
+}
+
+cuda_download() {
+  curl -fsSL --retry 3 -o "$HOME/$RUNFILE" "https://developer.download.nvidia.com/compute/cuda/$CUDA/local_installers/$RUNFILE" &&
+    echo "$RUNFILE_MD5  $HOME/$RUNFILE" | md5sum -c -
+}
+
+cuda_install() {  # ROOT: toolkit only, no driver; no_new_privs blocks sudo
+  mkdir -p "$HOME/cuda-tmp" &&
+    setpriv --no-new-privs sh "$HOME/$RUNFILE" --silent --toolkit --toolkitpath="$1" --defaultroot="$1" \
+      --no-man-page --tmpdir="$HOME/cuda-tmp"
+}
 
 weights_and_gpu() {  # every GPU stage starts on a fresh instance
   check "CUDA visible to torch" run python -c "import torch; assert torch.cuda.is_available()"
@@ -42,11 +74,28 @@ screen)
   check "memory ${memory} MiB >= 22888" test "$memory" -ge 22888
   check "driver $driver >= 580" test "$driver" -ge 580
   check "compute capability $capability >= 8.0" python3 -c "import sys; sys.exit(float('$capability') < 8.0)"
+  log "host: $(nproc) CPUs, $(free -g | awk '/Mem:/ {print $2}') GB RAM, $(df -h . | awk 'NR == 2 {print $4}') free disk"
+  # The install supplies tools; the checks below, unchanged, decide whether they work.
+  if root=$(cuda_toolkit); then
+    log "CUDA toolkit: existing, $root"
+  else
+    root=$HOME/cuda-$CUDA start=$(date +%s)
+    if ! problem=$(cuda_prerequisites); then
+      result="not installed, $problem"
+    elif ! cuda_download >> "$out/$stage.log" 2>&1; then
+      result="download or checksum failed"
+    else
+      cuda_install "$root" >> "$out/$stage.log" 2>&1
+      result="installer exit $?"  # can be nonzero as non-root with the toolkit complete
+      cp /tmp/cuda-installer.log "$out/" 2>/dev/null  # where the non-root installer writes its log
+    fi
+    log "CUDA toolkit: $CUDA $result, $root, $(( $(date +%s) - start )) s"
+  fi
+  export PATH="$root/bin:$PATH" CUDA_HOME=$root  # the extension build, the sanitizer and ncu use this toolkit
   check "nvcc is CUDA 13" sh -c 'nvcc --version | grep -q "release 13\."'
   log "execution context: $([ -f /.dockerenv ] && echo container || echo host)"
   log "sudo without password: $(sudo -n true 2>/dev/null && echo yes || echo no)"
   log "profiling restricted to admins: $(grep -i RmProfilingAdminOnly /proc/driver/nvidia/params 2>/dev/null || echo unknown)"
-  log "host: $(nproc) CPUs, $(free -g | awk '/Mem:/ {print $2}') GB RAM, $(df -h . | awk 'NR == 2 {print $4}') free disk"
   start=$(date +%s)
   check "locked install" uv sync --locked --extra bench
   log "install seconds: $(( $(date +%s) - start ))"
@@ -56,7 +105,7 @@ screen)
   check "compute-sanitizer memcheck" compute-sanitizer --tool memcheck --error-exitcode 1 .venv/bin/python bench/probes.py extension
   # ncu must exit 0 and its CSV must hold a positive counter value; an error message can name the metric.
   check "ncu counters" sh -c "ncu --csv --kernel-name add_one --metrics sm__cycles_elapsed.avg .venv/bin/python bench/probes.py extension > '$out/ncu.csv' 2>&1 && .venv/bin/python bench/probes.py ncu-check '$out/ncu.csv'"
-  check "nsys" sh -c "nsys --version"
+  log "nsys: $(nsys --version 2>/dev/null || echo unavailable)"  # optional; the PyTorch profiler supplies the timeline
   check "vllm extensions" run python bench/probes.py vllm
   ;;
 probe)

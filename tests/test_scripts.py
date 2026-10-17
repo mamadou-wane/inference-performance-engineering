@@ -1,12 +1,17 @@
 """bench/session.sh and bench/brev_session.sh against stub tools: no GPU, no Brev account.
 
 session.sh: a failed correctness check stops the stage before any profiling or timing, and the
-ncu check needs both a clean exit and a counter value. brev_session.sh: the instance is deleted,
+ncu check needs both a clean exit and a counter value; nsys is recorded and never fails the screen. The screen uses an existing CUDA 13 toolkit
+that holds nvcc, ncu and compute-sanitizer; without one it checks the installer's prerequisites
+(which gcc, gcc 6 to 15, the download tools) before downloading the pinned runfile, runs it only
+after its checksum passes, installs the toolkit alone under HOME with no_new_privs, and records the
+installer's exit status apart from the tool checks. The real installer's behavior is not covered. brev_session.sh: the instance is deleted,
 and the deletion confirmed by a successful brev ls, after completion, failure, timeout and
 interruption; a budget too small creates nothing; an unconfirmed deletion exits 3.
 """
 
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -26,7 +31,8 @@ def stub(directory: Path, name: str, body: str) -> None:
 
 @pytest.fixture
 def tools(tmp_path):
-    """A PATH directory of stubs; each call is appended to calls.log."""
+    """A PATH directory of stubs; each call is appended to calls.log. curl delivers a fake CUDA runfile
+    whose installer copies a toolkit of logging stubs to --toolkitpath."""
     directory = tmp_path / "bin"
     directory.mkdir()
     log = tmp_path / "calls.log"
@@ -34,15 +40,34 @@ def tools(tmp_path):
         stub(directory, name, f'echo "{name} $*" >> {log}\n')
     stub(directory, "nvidia-smi", f'echo "nvidia-smi $*" >> {log}\necho "NVIDIA RTX A6000, 49140 MiB, 580.95.05, 8.6"\n')
     stub(directory, "nvcc", 'echo "Cuda compilation tools, release 13.0, V13.0.88"\n')
-    stub(directory, "uv", f'echo "uv $*" >> {log}\n[[ "$*" == *pytest* && -n "${{SUITE_FAILS:-}}" ]] && exit 1\nexit 0\n')
+    stub(directory, "uv", f'echo "uv $*${{CUDA_HOME:+ CUDA_HOME=$CUDA_HOME}}" >> {log}\n'
+                          '[[ "$*" == *pytest* && -n "${SUITE_FAILS:-}" ]] && exit 1\nexit 0\n')
+    toolkit = tmp_path / "toolkit" / "bin"
+    toolkit.mkdir(parents=True)
+    stub(toolkit, "nvcc", 'echo "Cuda compilation tools, release 13.0, V13.0.88"\n')
+    for name in ("ncu", "compute-sanitizer"):
+        stub(toolkit, name, f'echo "installed {name} $*" >> {log}\n')
+    stub(tmp_path, "runfile", f'echo "installer $*" >> {log}\n'
+                              'for arg; do case $arg in --toolkitpath=*) root=${arg#*=} ;; esac; done\n'
+                              f'mkdir -p "$root" && cp -R {toolkit.parent}/. "$root"\n'
+                              'exit "${INSTALLER_EXIT:-0}"\n')
+    stub(directory, "gcc", '[ "$1" = -dumpversion ] && echo "${GCC_VERSION:-13}"\n')
+    stub(directory, "curl", f'echo "curl $*" >> {log}\n'
+                            'while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+                            f'cp {tmp_path}/runfile "$out"\n')
+    stub(directory, "md5sum", f'echo "md5sum $* $(cat)" >> {log}\n[ -z "${{MD5_FAILS:-}}" ]\n')
+    stub(directory, "setpriv", f'echo "setpriv $*" >> {log}\nshift\nexec "$@"\n')
     return directory, log
 
 
 def session(tools, tmp_path, stage, **env):
     directory, _ = tools
     out = tmp_path / "out"
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
     return subprocess.run(["bash", str(ROOT / "bench/session.sh"), stage, str(out)], cwd=ROOT, text=True,
-                          capture_output=True, env={**os.environ, "PATH": f"{directory}:{os.environ['PATH']}", **env},
+                          capture_output=True, env={**os.environ, "PATH": f"{directory}:{os.environ['PATH']}",
+                                                    "HOME": str(home), **env},
                           timeout=120, check=False), out
 
 
@@ -79,6 +104,97 @@ def test_the_ncu_screen_needs_a_clean_exit_and_a_counter(tools, tmp_path, output
     _, out = session(tools, tmp_path, "screen")
     log = (out / "screen.log").read_text()
     assert ("PASS ncu counters" in log) is passes and ("FAIL ncu counters" in log) is not passes
+
+
+@pytest.mark.parametrize(("nsys", "recorded"), [("echo 'NVIDIA Nsight Systems version 2025.3.2.474'", "version 2025"),
+                                                 ("exit 127", "unavailable")])
+def test_nsys_is_recorded_and_never_fails_the_screen(tools, tmp_path, nsys, recorded):
+    stub(tools[0], "ncu", f'echo "ncu $*" >> {tools[1]}\n')
+    stub(tools[0], "nsys", nsys + "\n")
+    _, out = session(tools, tmp_path, "screen")
+    log = (out / "screen.log").read_text().splitlines()
+    assert any(line.startswith("nsys: ") and recorded in line for line in log)
+    assert not any(line.startswith(("PASS", "FAIL")) and "nsys" in line for line in log)
+
+
+def test_an_existing_cuda_13_toolkit_is_used_and_nothing_is_downloaded(tools, tmp_path):
+    stub(tools[0], "ncu", f'echo "ncu $*" >> {tools[1]}\n')
+    _, out = session(tools, tmp_path, "screen")
+    log, calls = (out / "screen.log").read_text(), tools[1].read_text()
+    assert f"CUDA toolkit: existing, {tmp_path}" in log and "PASS nvcc is CUDA 13" in log
+    assert not any(line.startswith(("curl ", "setpriv ", "installer ")) for line in calls.splitlines())
+    assert f"probes.py extension CUDA_HOME={tmp_path}" in calls
+
+
+# A CUDA 13 toolkit in /usr/local is found before the stubs, and these tests would see no install.
+no_system_cuda = pytest.mark.skipif(any(Path("/usr/local").glob("cuda*/bin/nvcc")), reason="system CUDA toolkit")
+
+
+@no_system_cuda
+@pytest.mark.parametrize("missing", ["nvcc 13", "ncu", "compute-sanitizer"])
+def test_missing_cuda_13_tools_install_the_toolkit_alone_under_home(tools, tmp_path, missing):
+    if missing != "ncu":
+        stub(tools[0], "ncu", f'echo "ncu $*" >> {tools[1]}\n')
+    if missing == "nvcc 13":
+        stub(tools[0], "nvcc", 'echo "Cuda compilation tools, release 12.8, V12.8.93"\n')
+    if missing == "compute-sanitizer":
+        (tools[0] / "compute-sanitizer").unlink()
+    _, out = session(tools, tmp_path, "screen")
+    log, calls = (out / "screen.log").read_text(), tools[1].read_text()
+    home, runfile = tmp_path / "home", "cuda_13.0.3_580.126.20_linux.run"
+    assert f"https://developer.download.nvidia.com/compute/cuda/13.0.3/local_installers/{runfile}" in calls
+    assert f"md5sum -c - 13acdcabcb9e939f716c29eff8c12181  {home}/{runfile}" in calls
+    installer = next(line for line in calls.splitlines() if line.startswith("setpriv")).split()
+    # The toolkit alone (no --driver), every path under HOME, no man pages in /usr/share/man.
+    assert installer == ["setpriv", "--no-new-privs", "sh", f"{home}/{runfile}", "--silent", "--toolkit",
+                         f"--toolkitpath={home}/cuda-13.0.3", f"--defaultroot={home}/cuda-13.0.3", "--no-man-page",
+                         f"--tmpdir={home}/cuda-tmp"]
+    assert f"CUDA toolkit: 13.0.3 installer exit 0, {home}/cuda-13.0.3" in log and "PASS nvcc is CUDA 13" in log
+    assert log.index("free disk") < log.index("CUDA toolkit:")
+    assert "installed compute-sanitizer --tool memcheck" in calls and "installed ncu --csv" in calls
+    assert f"probes.py extension CUDA_HOME={home}/cuda-13.0.3" in calls
+
+
+@no_system_cuda
+def test_a_runfile_that_fails_its_checksum_is_never_run(tools, tmp_path):
+    stub(tools[0], "nvcc", 'echo "Cuda compilation tools, release 12.8, V12.8.93"\n')
+    result, out = session(tools, tmp_path, "screen", MD5_FAILS="1")
+    log, calls = (out / "screen.log").read_text(), tools[1].read_text()
+    assert result.returncode == 1 and "CUDA toolkit: 13.0.3 download or checksum failed" in log
+    assert "FAIL nvcc is CUDA 13" in log
+    assert not any(line.startswith(("setpriv ", "installer ")) for line in calls.splitlines())
+
+
+@no_system_cuda
+def test_a_nonzero_installer_exit_is_recorded_and_the_checks_still_decide(tools, tmp_path):
+    """The non-root installer can exit nonzero with the toolkit complete; the tool checks judge it."""
+    stub(tools[0], "nvcc", 'echo "Cuda compilation tools, release 12.8, V12.8.93"\n')
+    stub(tools[0], "ncu", f'echo "ncu $*" >> {tools[1]}\n')
+    _, out = session(tools, tmp_path, "screen", INSTALLER_EXIT="1")
+    log, calls = (out / "screen.log").read_text(), tools[1].read_text()
+    assert "CUDA toolkit: 13.0.3 installer exit 1" in log and "PASS nvcc is CUDA 13" in log
+    assert "installed compute-sanitizer --tool memcheck" in calls
+
+
+@no_system_cuda
+@pytest.mark.parametrize(("setup", "reason"), [
+    ({"which": "exit 1\n"}, "which gcc fails"),
+    ({"GCC_VERSION": "16"}, "gcc 16, CUDA 13.0 supports 6 to 15"),
+    ({"GCC_VERSION": "5.4.0"}, "gcc 5, CUDA 13.0 supports 6 to 15"),
+    pytest.param({"setpriv": None}, "no setpriv",
+                 marks=pytest.mark.skipif(bool(shutil.which("setpriv")), reason="system setpriv")),
+])
+def test_missing_install_prerequisites_stop_before_the_download(tools, tmp_path, setup, reason):
+    stub(tools[0], "nvcc", 'echo "Cuda compilation tools, release 12.8, V12.8.93"\n')
+    env = {key: value for key, value in setup.items() if key.isupper()}
+    for name, body in setup.items():
+        if name.islower():
+            (tools[0] / name).unlink() if body is None else stub(tools[0], name, body)
+    result, out = session(tools, tmp_path, "screen", **env)
+    log, calls = (out / "screen.log").read_text(), tools[1].read_text()
+    assert result.returncode == 1 and f"CUDA toolkit: 13.0.3 not installed, {reason}" in log
+    assert "FAIL nvcc is CUDA 13" in log
+    assert not any(line.startswith(("curl ", "setpriv ", "installer ")) for line in calls.splitlines())
 
 
 @pytest.fixture
